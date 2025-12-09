@@ -1,93 +1,97 @@
-import numpy as np
-import open3d as o3d
-from pathlib import Path
+def evaluate_alignment(estimated_points_file, gt_ply_file, out_dir,
+                       voxel_size=0.05, icp_threshold=0.2):
+    """
+    Evaluate alignment of estimated 3D points against GT point cloud using ICP.
+    Supports:
+      - .npy (Nx3)
+      - COLMAP sparse folder (points3D.bin)
+    """
+    import numpy as np
+    import open3d as o3d
+    from pathlib import Path
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-ROOT = Path(__file__).resolve().parents[1]   # VisionPipeline/
+    estimated_points_file = Path(estimated_points_file)
+    gt_ply_file = Path(gt_ply_file)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-EST_POINTS_NPY = (
-    ROOT / "refinement" / "refinement_output" / "triangulated_points_refined_filtered.npy"
-)
+    # -----------------------------
+    # Load estimated 3D points
+    # -----------------------------
+    if estimated_points_file.is_dir():
+        # 👉 COLMAP sparse directory
+        from colmap_utils.read_write_model import read_model
 
-GT_PLY = (
-    ROOT / "data" / "dataset_kicker" / "ground_truth_scan" / "scan2.ply"
-)
+        print(f"[INFO] Loading COLMAP sparse from {estimated_points_file}")
+        _, _, points3D = read_model(str(estimated_points_file), ext=".bin")
+        points_est = np.array([p.xyz for p in points3D.values()], dtype=np.float32)
 
-OUT_DIR = ROOT / "evaluation" / "evaluation_output"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+    else:
+        # 👉 .npy file
+        print(f"[INFO] Loading estimated points from {estimated_points_file}")
+        points_est = np.load(estimated_points_file)
 
-# -----------------------------
-# Load estimated 3D points
-# -----------------------------
-print("Loading estimated 3D points...")
-points_est = np.load(EST_POINTS_NPY)   # N x 3
-pc_est = o3d.geometry.PointCloud()
-pc_est.points = o3d.utility.Vector3dVector(points_est)
+    if points_est.shape[0] == 0:
+        raise RuntimeError("No estimated 3D points loaded")
 
-print(f"Estimated points: {points_est.shape[0]}")
+    pc_est = o3d.geometry.PointCloud()
+    pc_est.points = o3d.utility.Vector3dVector(points_est)
 
-# -----------------------------
-# Load GT point cloud
-# -----------------------------
-print("Loading GT point cloud...")
-if not GT_PLY.exists():
-    raise FileNotFoundError(f"GT PLY not found: {GT_PLY}")
+    print(f"[INFO] Estimated points: {points_est.shape[0]}")
 
-pc_gt = o3d.io.read_point_cloud(str(GT_PLY))
-print(f"GT points: {len(pc_gt.points)}")
+    # -----------------------------
+    # Load GT point cloud
+    # -----------------------------
+    if not gt_ply_file.exists():
+        raise FileNotFoundError(f"GT PLY not found: {gt_ply_file}")
 
-# -----------------------------
-# Downsample (for stable ICP)
-# -----------------------------
-voxel = 0.05  # meter (5cm)
-pc_est_ds = pc_est.voxel_down_sample(voxel)
-pc_gt_ds = pc_gt.voxel_down_sample(voxel)
+    pc_gt = o3d.io.read_point_cloud(str(gt_ply_file))
+    print(f"[INFO] GT points: {len(pc_gt.points)}")
 
-# -----------------------------
-# ICP Alignment (point-to-point)
-# -----------------------------
-print("Running ICP alignment...")
-threshold = 0.2  # meter
-reg = o3d.pipelines.registration.registration_icp(
-    pc_est_ds,
-    pc_gt_ds,
-    threshold,
-    np.eye(4),
-    o3d.pipelines.registration.TransformationEstimationPointToPoint()
-)
+    # -----------------------------
+    # Downsample
+    # -----------------------------
+    pc_est_ds = pc_est.voxel_down_sample(voxel_size)
+    pc_gt_ds = pc_gt.voxel_down_sample(voxel_size)
 
-T = reg.transformation
-print("Transformation:\n", T)
+    # -----------------------------
+    # ICP alignment
+    # -----------------------------
+    reg = o3d.pipelines.registration.registration_icp(
+        pc_est_ds,
+        pc_gt_ds,
+        icp_threshold,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    )
 
-pc_est.transform(T)
+    T = reg.transformation
+    pc_est.transform(T)
 
-# -----------------------------
-# Distance evaluation
-# -----------------------------
-print("Computing distances...")
-distances = pc_est.compute_point_cloud_distance(pc_gt)
-distances = np.asarray(distances)
+    # -----------------------------
+    # Distance evaluation
+    # -----------------------------
+    distances = np.asarray(pc_est.compute_point_cloud_distance(pc_gt))
+    rmse = float(np.sqrt(np.mean(distances ** 2)))
+    mean_err = float(np.mean(distances))
+    median_err = float(np.median(distances))
 
-rmse = np.sqrt(np.mean(distances ** 2))
-mean_err = np.mean(distances)
-median_err = np.median(distances)
+    # -----------------------------
+    # Save results
+    # -----------------------------
+    np.save(out_dir / "distances.npy", distances)
+    o3d.io.write_point_cloud(
+        str(out_dir / "aligned_estimated_points.ply"), pc_est
+    )
 
-# -----------------------------
-# Save results
-# -----------------------------
-np.save(OUT_DIR / "distances.npy", distances)
-o3d.io.write_point_cloud(
-    str(OUT_DIR / "aligned_estimated_points.ply"), pc_est
-)
+    with open(out_dir / "summary.txt", "w") as f:
+        f.write(f"Mean error (m): {mean_err:.4f}\n")
+        f.write(f"Median error (m): {median_err:.4f}\n")
+        f.write(f"RMSE (m): {rmse:.4f}\n")
 
-with open(OUT_DIR / "summary.txt", "w") as f:
-    f.write(f"Mean error (m): {mean_err:.4f}\n")
-    f.write(f"Median error (m): {median_err:.4f}\n")
-    f.write(f"RMSE (m): {rmse:.4f}\n")
+    print(f"[OK] Alignment evaluation finished")
+    print(f"     Mean   : {mean_err*100:.2f} cm")
+    print(f"     Median : {median_err*100:.2f} cm")
+    print(f"     RMSE   : {rmse*100:.2f} cm")
 
-print("\n✅ Evaluation finished")
-print(f"Mean error   : {mean_err*100:.2f} cm")
-print(f"Median error : {median_err*100:.2f} cm")
-print(f"RMSE         : {rmse*100:.2f} cm")
+    return distances, mean_err, median_err, rmse
